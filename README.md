@@ -164,6 +164,17 @@ gives a daemon that force-stops and starts a package that is not there. From
 32567 upstream has properties for both and the patch only moves their defaults;
 before that it edits the three places that spell it out.
 
+`0006-explicit-late-load-modules.patch` — adds a `ksud late-load --modules`
+switch and a late-load compatibility stage. It is the command-line equivalent
+of opting into module startup, but it deliberately does **not** replay both
+`post-fs-data.sh` and `late-load.sh`: an enabled module with `late-load.sh` gets
+that script, while a legacy module without it falls back to `post-fs-data.sh`
+exactly once. Global scripts stay on `late-load.d`; global `post-fs-data.d` is
+not replayed after Android has booted. The init mount namespace is mandatory in
+this mode, then `system.prop`, the metamodule mount and `post-mount` run before
+service/boot-completed. The default remains off because entering this flow on a
+live framework is an explicit device policy, not a safe generic late-load.
+
 ### `galaxy/`
 
 `0001-samsung-kdp-rkp-defex.patch` — a generic build panics on Samsung
