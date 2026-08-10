@@ -3,7 +3,7 @@ diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
 +++ b/userspace/ksud/src/late_load.rs
 @@ -5,0 +6 @@
 +use std::path::Path;
-@@ -21,0 +23,68 @@
+@@ -21,0 +23,85 @@
 +fn start_vector_toybox_compat_daemon() -> Result<()> {
 +    const VECTOR_DIR: &str = "/data/adb/modules/zygisk_vector";
 +    const VECTOR_SOCKET: &str = "/data/adb/lspd/.cli_sock";
@@ -28,9 +28,18 @@ diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
 +        return Ok(());
 +    }
 +
-+    if Path::new(VECTOR_SOCKET).exists() {
-+        info!("Asteroids late-load: Vector CLI socket already present");
++    // A pathname alone is not a readiness signal for AF_UNIX sockets. Vector
++    // can leave .cli_sock behind when its daemon dies, including across our
++    // late-load experiments. Only treat the socket as ready when something is
++    // actually listening on it; otherwise remove the stale node before start.
++    if std::os::unix::net::UnixStream::connect(VECTOR_SOCKET).is_ok() {
++        info!("Asteroids late-load: Vector CLI socket already accepting connections");
 +        return Ok(());
++    }
++    if Path::new(VECTOR_SOCKET).exists() {
++        warn!("Asteroids late-load: removing stale Vector CLI socket");
++        fs::remove_file(VECTOR_SOCKET)
++            .context("failed to remove stale Vector CLI socket")?;
 +    }
 +
 +    // Vector's current service.sh uses util-linux syntax:
@@ -52,24 +61,32 @@ diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
 +        .spawn()
 +        .context("failed to start Vector compatibility daemon")?;
 +
-+    // Catch an immediate command/syntax failure and otherwise give the daemon
-+    // a bounded head start. The socket is created by the root-side Vector
-+    // daemon and is the same readiness signal used by its manager IPC path.
-+    for _ in 0..30 {
-+        if Path::new(VECTOR_SOCKET).exists() {
++    // Vector's launcher may exit 0 after successfully spawning the real
++    // app_process/RuntimeInit daemon. A successful launcher exit is therefore
++    // not a daemon failure. Keep waiting for the live AF_UNIX listener and only
++    // treat a non-zero launcher status as an immediate startup failure.
++    let mut launcher_reaped = false;
++    for _ in 0..50 {
++        if std::os::unix::net::UnixStream::connect(VECTOR_SOCKET).is_ok() {
 +            info!("Asteroids late-load: Vector compatibility daemon ready");
 +            return Ok(());
 +        }
-+        if let Some(status) = child
-+            .try_wait()
-+            .context("failed to poll Vector compatibility daemon")?
-+        {
-+            anyhow::bail!("Vector compatibility daemon exited early: {status}");
++        if !launcher_reaped {
++            if let Some(status) = child
++                .try_wait()
++                .context("failed to poll Vector compatibility launcher")?
++            {
++                if !status.success() {
++                    anyhow::bail!("Vector compatibility launcher failed: {status}");
++                }
++                info!("Asteroids late-load: Vector compatibility launcher exited successfully; waiting for daemon socket");
++                launcher_reaped = true;
++            }
 +        }
 +        thread::sleep(Duration::from_millis(100));
 +    }
 +
-+    warn!("Asteroids late-load: Vector daemon is running but CLI socket is not ready yet");
++    warn!("Asteroids late-load: Vector CLI socket not ready after compatibility launch");
 +    Ok(())
 +}
 @@ -260,6 +329,7 @@
