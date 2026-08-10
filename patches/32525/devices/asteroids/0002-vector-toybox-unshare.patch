@@ -3,97 +3,132 @@ diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
 +++ b/userspace/ksud/src/late_load.rs
 @@ -5,0 +6 @@
 +use std::path::Path;
-@@ -21,0 +23,85 @@
-+fn start_vector_toybox_compat_daemon() -> Result<()> {
-+    const VECTOR_DIR: &str = "/data/adb/modules/zygisk_vector";
-+    const VECTOR_SOCKET: &str = "/data/adb/lspd/.cli_sock";
+@@ -21,0 +23,115 @@
++const VECTOR_DIR: &str = "/data/adb/modules/zygisk_vector";
++const VECTOR_SOCKET: &str = "/data/adb/lspd/.cli_sock";
 +
++fn vector_module_enabled() -> bool {
 +    let module_dir = Path::new(VECTOR_DIR);
-+    if !module_dir.is_dir()
-+        || module_dir.join("disable").exists()
-+        || module_dir.join("remove").exists()
-+    {
++    module_dir.is_dir()
++        && !module_dir.join("disable").exists()
++        && !module_dir.join("remove").exists()
++        && module_dir.join("service.sh").is_file()
++        && module_dir.join("daemon").is_file()
++}
++
++fn patch_vector_service_for_toybox() -> Result<()> {
++    let service_path = Path::new(VECTOR_DIR).join("service.sh");
++    let service = fs::read_to_string(&service_path)
++        .context("failed to read Vector service.sh")?;
++
++    if !service.contains("unshare --propagation slave -m") {
++        info!("Asteroids late-load: Vector service.sh is already toybox-compatible");
 +        return Ok(());
 +    }
 +
-+    let service = module_dir.join("service.sh");
-+    let daemon = module_dir.join("daemon");
-+    if !service.is_file() || !daemon.is_file() {
-+        return Ok(());
++    let backup_path = Path::new(VECTOR_DIR).join("service.sh.rmn-stock");
++    if !backup_path.exists() {
++        fs::copy(&service_path, &backup_path)
++            .context("failed to back up Vector service.sh")?;
 +    }
 +
-+    let script = fs::read_to_string(&service)
-+        .with_context(|| format!("failed to read {}", service.display()))?;
-+    if !script.contains("unshare --propagation slave -m") {
-+        return Ok(());
-+    }
++    const TOYBOX_SERVICE: &str = r#"#!/system/bin/sh
 +
-+    // A pathname alone is not a readiness signal for AF_UNIX sockets. Vector
-+    // can leave .cli_sock behind when its daemon dies, including across our
-+    // late-load experiments. Only treat the socket as ready when something is
-+    // actually listening on it; otherwise remove the stale node before start.
++MODDIR="${0%/*}"
++cd "$MODDIR" || exit 1
++
++# Android toybox unshare has -m/--mount, but not util-linux
++# --propagation. Recreate `--propagation slave` inside the new namespace.
++unshare -m sh -c '
++    mount -o rslave none / || exit 1
++    DAEMON="$1"
++    shift
++    exec "$DAEMON" --system-server-max-retry=3 "$@"
++' sh "$MODDIR/daemon" "$@" &
++"#;
++
++    fs::write(&service_path, TOYBOX_SERVICE)
++        .context("failed to install toybox-compatible Vector service.sh")?;
++    let mut perms = fs::metadata(&service_path)?.permissions();
++    perms.set_mode(0o755);
++    fs::set_permissions(&service_path, perms)?;
++    info!("Asteroids late-load: Vector service.sh patched for Android toybox unshare");
++    Ok(())
++}
++
++fn stop_stale_vector_daemon() {
++    let Some(pids) = process_id("vectord") else {
++        return;
++    };
++    warn!("Asteroids late-load: stopping stale Vector daemon(s): {pids}");
++    for pid in pids.split_whitespace() {
++        match Command::new("/system/bin/kill").args(["-9", pid]).status() {
++            Ok(status) if status.success() => {}
++            Ok(status) => warn!("Asteroids late-load: kill -9 {pid} exited {status}"),
++            Err(err) => warn!("Asteroids late-load: failed to kill stale Vector pid {pid}: {err}"),
++        }
++    }
++    thread::sleep(Duration::from_millis(250));
++}
++
++fn prepare_vector_service_stage() -> Result<bool> {
++    if !vector_module_enabled() {
++        info!("Asteroids late-load: Vector service readiness skipped: module unavailable or disabled");
++        return Ok(false);
++    }
++    patch_vector_service_for_toybox()?;
++
 +    if std::os::unix::net::UnixStream::connect(VECTOR_SOCKET).is_ok() {
 +        info!("Asteroids late-load: Vector CLI socket already accepting connections");
-+        return Ok(());
++        return Ok(true);
 +    }
++
++    // A dead daemon can retain the Java lock or leave the socket pathname
++    // behind. Clear only the unhealthy case, then let KernelSU's normal
++    // service stage execute Vector's own service.sh in its native script
++    // environment. This is the path that reached RuntimeInit on Asteroids.
++    stop_stale_vector_daemon();
 +    if Path::new(VECTOR_SOCKET).exists() {
-+        warn!("Asteroids late-load: removing stale Vector CLI socket");
++        warn!("Asteroids late-load: removing stale Vector CLI socket before service stage");
 +        fs::remove_file(VECTOR_SOCKET)
-+            .context("failed to remove stale Vector CLI socket")?;
++            .context("failed to remove stale Vector CLI socket before service stage")?;
 +    }
++    info!("Asteroids late-load: Vector prepared; native service.sh will launch daemon");
++    Ok(true)
++}
 +
-+    // Vector's current service.sh uses util-linux syntax:
-+    //   unshare --propagation slave -m ...
-+    // Android's toybox unshare accepts -m but not --propagation. Reproduce
-+    // the same namespace setup with toybox-compatible primitives instead of
-+    // modifying the installed module. The normal service stage still runs;
-+    // its unsupported unshare invocation may log an error, but this daemon is
-+    // already alive before the replacement zygote/system_server is created.
-+    info!("Asteroids late-load: starting Vector with toybox-compatible unshare");
-+    let daemon_path = daemon.to_string_lossy().into_owned();
-+    let mut child = Command::new("/system/bin/unshare")
-+        .arg("-m")
-+        .arg("/system/bin/sh")
-+        .arg("-c")
-+        .arg("mount -o rslave none / || exit 1; exec \"$1\" --system-server-max-retry=3")
-+        .arg("sh")
-+        .arg(&daemon_path)
-+        .spawn()
-+        .context("failed to start Vector compatibility daemon")?;
++fn wait_vector_service_ready() -> Result<()> {
++    info!("Asteroids late-load: waiting for Vector service-stage daemon readiness");
 +
-+    // Vector's launcher may exit 0 after successfully spawning the real
-+    // app_process/RuntimeInit daemon. A successful launcher exit is therefore
-+    // not a daemon failure. Keep waiting for the live AF_UNIX listener and only
-+    // treat a non-zero launcher status as an immediate startup failure.
-+    let mut launcher_reaped = false;
-+    for _ in 0..50 {
-+        if std::os::unix::net::UnixStream::connect(VECTOR_SOCKET).is_ok() {
-+            info!("Asteroids late-load: Vector compatibility daemon ready");
++    // VectorDaemon registers its `serial` Binder proxy before CliSocketServer.
++    // Because the stale socket was removed above, a newly-created socket plus
++    // a live vectord is a side-effect-free readiness signal. Avoid connecting
++    // to the CLI socket here because its protocol expects an authenticated
++    // request immediately after accept().
++    for _ in 0..100 {
++        if Path::new(VECTOR_SOCKET).exists() && process_id("vectord").is_some() {
++            info!("Asteroids late-load: Vector service-stage daemon ready");
 +            return Ok(());
-+        }
-+        if !launcher_reaped {
-+            if let Some(status) = child
-+                .try_wait()
-+                .context("failed to poll Vector compatibility launcher")?
-+            {
-+                if !status.success() {
-+                    anyhow::bail!("Vector compatibility launcher failed: {status}");
-+                }
-+                info!("Asteroids late-load: Vector compatibility launcher exited successfully; waiting for daemon socket");
-+                launcher_reaped = true;
-+            }
 +        }
 +        thread::sleep(Duration::from_millis(100));
 +    }
 +
-+    warn!("Asteroids late-load: Vector CLI socket not ready after compatibility launch");
-+    Ok(())
++    let daemon = process_id("vectord");
++    anyhow::bail!(
++        "Vector service stage did not become ready within 10 seconds (vectord={daemon:?}, socket_exists={})",
++        Path::new(VECTOR_SOCKET).exists()
++    )
 +}
-@@ -260,6 +329,7 @@
+@@ -260,6 +375,11 @@
      // already running. Give non-blocking service scripts a short head start,
      // then recreate the zygote-start boundary.
      if run_module_scripts {
-+        start_vector_toybox_compat_daemon()?;
++        let wait_for_vector = prepare_vector_service_stage()?;
          init_event::run_stage("service", false);
-         thread::sleep(Duration::from_millis(1000));
+-        thread::sleep(Duration::from_millis(1000));
++        if wait_for_vector {
++            wait_vector_service_ready()?;
++        } else {
++            thread::sleep(Duration::from_millis(1000));
++        }
          restart_zygote_for_late_modules()?;
