@@ -10,7 +10,8 @@ to only one of them could not be honoured. A delta that genuinely applies to one
 of them and not the other means they are different modules and want different
 ids.
 
-There are currently two device sets, `quest3` and `asteroids`, and the list
+There are currently three device sets, `quest3`, `asteroids` and
+`oneplus-pad3`, and the list
 should stay small. A patch here is one nothing else can use, so reach for it
 only after `common` and the vendor sets have been ruled out. As with any set, a
 `devices/<id>` with no patches in it fails the build that names it rather than
@@ -32,6 +33,16 @@ service stage is launched. The policy is tied to the explicit `--modules`
 request rather than to one hard-coded Zygisk module ID, so NeoZygisk/Zygisk
 provider names can change without silently disabling injection. A live zygote
 restart is intentionally not a common late-load policy.
+
+`oneplus-pad3` implements the corresponding late-load contract for the exact
+OPD2415 build without sharing Asteroids assumptions. It verifies replacement
+`system_server` before dispatching normal services, adapts an installed Vector
+service and verifies its bridge, propagates every module-stage failure, accepts
+the staged daemon only through a root-private path and pinned SHA-256, and
+commits a root-private nonce/boot/hash receipt only after enforcing SELinux is
+restored. Because this set changes `ksud`, its consuming build must package the
+same daemon into its Manager and sign that Manager with the certificate its LKM
+accepts; the common-only Manager is not interchangeable.
 
 These live here rather than beside the target in the consuming repository for
 the same reason the rest do: they are a derivative work of KernelSU and carry

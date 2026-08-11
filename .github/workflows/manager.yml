@@ -20,9 +20,10 @@ name: Manager
 #     the upstream one and matches the module Root-My-Device-Payloads builds.
 #
 # The bundled ksud carries no LKM. Root-My-Device loads the module with its own
-# ksud, and the DDK-built module upstream ships would not load on Quest 3
-# anyway. This manager is here to keep the daemon on the device patched, not to
-# install KernelSU.
+# ksud. This manager is here to keep the daemon on the device patched, not to
+# install KernelSU. Device patch sets that modify userspace must be selected
+# explicitly so the Manager cannot replace a target daemon with a common-only
+# one.
 #
 # Hand-started only, and it publishes only with the box ticked. Leaving the box
 # alone is the check -- it builds the manager and runs every assertion on it
@@ -38,6 +39,15 @@ on:
         description: KernelSU revision to build, and the one the patches must apply to
         required: true
         default: b0bc817b4e966aa6aa830834eaf6ef765d821d40
+      variant:
+        description: Patch variant to validate; only common produces an installable Manager here
+        required: true
+        type: choice
+        options:
+          - common
+          - asteroids
+          - oneplus-pad3
+        default: common
       release:
         description: publish a GitHub release as well as an artifact
         type: boolean
@@ -89,7 +99,10 @@ jobs:
           path: kernelsu
           fetch-depth: 0
 
-      - name: Apply the common patch set
+      - name: Apply the selected patch sets
+        env:
+          REQUESTED_VARIANT: ${{ inputs.variant || 'common' }}
+          PUBLISH_RELEASE: ${{ inputs.release || false }}
         run: |
           set -euo pipefail
           # The directory is derived from the checked-out tree, never named
@@ -99,37 +112,76 @@ jobs:
           echo "KernelSU version: $version"
           echo "KSU_VERSION=$version" >> "$GITHUB_ENV"
 
-          # common only, in filename order, the same way Root-My-Device-Payloads
-          # applies it. The sets a target names on top of it are kernel-side --
-          # devices/quest3 patches the module, not ksud -- so a manager built
-          # from common alone carries the same daemon every target's build does.
-          # A userspace patch that ever lands in a non-common set breaks that,
-          # and this is where to notice.
-          set_dir="$GITHUB_WORKSPACE/patches-repo/patches/$version/common"
-          test -d "$set_dir" || { echo "::error::no patch set at patches/$version/common"; exit 1; }
+          # Match consuming builds exactly. The allowlist prevents arbitrary
+          # workflow input from becoming a filesystem path, artifact name or
+          # environment-file entry, and prevents incompatible device sets from
+          # being combined into a supposed universal daemon.
+          case "$REQUESTED_VARIANT" in
+            common)
+              sets=(common)
+              manager_build_allowed=true
+              ;;
+            asteroids)
+              sets=(common devices/asteroids)
+              manager_build_allowed=false
+              ;;
+            oneplus-pad3)
+              sets=(common devices/oneplus-pad3)
+              manager_build_allowed=false
+              ;;
+            *)
+              echo "::error::unsupported Manager patch variant: $REQUESTED_VARIANT"
+              exit 1
+              ;;
+          esac
+          if [ "$PUBLISH_RELEASE" = true ] && [ "$manager_build_allowed" != true ]; then
+            echo "::error::target-specific variants are validation-only in this workflow"
+            echo "::error::build their Manager with the consuming target so signer and embedded LKM match"
+            exit 1
+          fi
 
+          LC_ALL=C
           shopt -s nullglob
-          patches=("$set_dir"/*.patch)
-          test ${#patches[@]} -gt 0 || { echo "::error::patches/$version/common has no patches"; exit 1; }
-
-          for p in "${patches[@]}"; do
-            echo "-- $(basename "$p")"
-            git apply --check "$p"
-            git apply "$p"
+          : > "$GITHUB_WORKSPACE/applied-patches.txt"
+          for set_name in "${sets[@]}"; do
+            set_dir="$GITHUB_WORKSPACE/patches-repo/patches/$version/$set_name"
+            test -d "$set_dir" || {
+              echo "::error::no patch set at patches/$version/$set_name"; exit 1; }
+            patches=("$set_dir"/*.patch)
+            test ${#patches[@]} -gt 0 || {
+              echo "::error::patches/$version/$set_name has no patches"; exit 1; }
+            for p in "${patches[@]}"; do
+              test -f "$p" && test ! -L "$p" || {
+                echo "::error::patch is not a regular non-symlink file: $p"; exit 1; }
+              echo "-- $set_name/$(basename "$p")"
+              git apply --check "$p"
+              git apply "$p"
+              digest=$(sha256sum "$p" | awk '{print $1}')
+              printf '%s  %s\n' "$digest" "$set_name/$(basename "$p")" \
+                >> "$GITHUB_WORKSPACE/applied-patches.txt"
+            done
           done
+          git diff --check
+          echo "KSU_PATCH_VARIANT=$REQUESTED_VARIANT" >> "$GITHUB_ENV"
+          echo "MANAGER_BUILD_ALLOWED=$manager_build_allowed" >> "$GITHUB_ENV"
+          echo "Manager patch variant: $REQUESTED_VARIANT"
 
       - name: Set up Java
+        if: env.MANAGER_BUILD_ALLOWED == 'true'
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
 
       - uses: gradle/actions/setup-gradle@v6
+        if: env.MANAGER_BUILD_ALLOWED == 'true'
 
       - name: Set up the Android SDK
+        if: env.MANAGER_BUILD_ALLOWED == 'true'
         uses: android-actions/setup-android@v4
 
       - name: Set up build-tools
+        if: env.MANAGER_BUILD_ALLOWED == 'true'
         run: |
           sdkmanager "build-tools;35.0.0"
           echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
@@ -161,7 +213,35 @@ jobs:
               --manifest-path ./userspace/ksud/Cargo.toml
           done
 
+      - name: Record the exact daemon variant
+        run: |
+          set -euo pipefail
+          rmd_sha=$(git -C "$GITHUB_WORKSPACE/patches-repo" rev-parse HEAD)
+          ksu_sha=$(git rev-parse HEAD)
+          arm64_sha=$(sha256sum target/aarch64-linux-android/release/ksud | awk '{print $1}')
+          x86_64_sha=$(sha256sum target/x86_64-linux-android/release/ksud | awk '{print $1}')
+          if [ "$MANAGER_BUILD_ALLOWED" = true ]; then
+            signer="$EXPECTED_CERT_SHA256"
+          else
+            signer=consuming-build-required
+          fi
+          {
+            echo 'manifest_version=1'
+            echo "rmd_sha=$rmd_sha"
+            echo "ksu_sha=$ksu_sha"
+            echo "ksu_version=$KSU_VERSION"
+            echo "variant=$KSU_PATCH_VARIANT"
+            echo "installable_manager=$MANAGER_BUILD_ALLOWED"
+            echo "manager_package=$MANAGER_PACKAGE"
+            echo "manager_certificate_sha256=$signer"
+            echo "ksud_arm64_sha256=$arm64_sha"
+            echo "ksud_x86_64_sha256=$x86_64_sha"
+            sed 's/^/patch_sha256=/' "$GITHUB_WORKSPACE/applied-patches.txt"
+          } > "$GITHUB_WORKSPACE/variant-manifest.txt"
+          cat "$GITHUB_WORKSPACE/variant-manifest.txt"
+
       - name: Write the signing key
+        if: env.MANAGER_BUILD_ALLOWED == 'true'
         env:
           STORE_FILE: ${{ secrets.STORE_FILE }}
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
@@ -179,6 +259,7 @@ jobs:
           } >> manager/gradle.properties
 
       - name: Build the manager
+        if: env.MANAGER_BUILD_ALLOWED == 'true'
         working-directory: kernelsu/manager
         run: |
           ./gradlew clean assembleRelease \
@@ -187,6 +268,7 @@ jobs:
       # Gradle's APK carries no ksud; repack_apk.py is what puts one in, which
       # is also how upstream produces the APK it releases.
       - name: Repack with the patched ksud and re-sign
+        if: env.MANAGER_BUILD_ALLOWED == 'true'
         env:
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
@@ -197,9 +279,40 @@ jobs:
             -b release -t release \
             -a arm64-v8a -a x86_64 \
             -K key.jks -A "$KEY_ALIAS" -P "$STORE_PASSWORD" -S "$KEY_PASSWORD" \
-            -n "RootMyDeviceKSU_${KSU_VERSION}"
+            -n "RootMyDeviceKSU_${KSU_VERSION}_${KSU_PATCH_VARIANT}"
+
+      - name: Check the Manager bundles this run's exact daemons
+        if: env.MANAGER_BUILD_ALLOWED == 'true'
+        run: |
+          set -euo pipefail
+          apk=$(find dist -name '*.apk' -type f | head -n 1)
+          test -n "$apk" || { echo "::error::repack produced no apk"; exit 1; }
+          python3 - "$apk" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+          import zipfile
+
+          apk = pathlib.Path(sys.argv[1])
+          expected = {
+              "arm64-v8a": pathlib.Path("target/aarch64-linux-android/release/ksud"),
+              "x86_64": pathlib.Path("target/x86_64-linux-android/release/ksud"),
+          }
+          with zipfile.ZipFile(apk) as archive:
+              for abi, source in expected.items():
+                  entry = f"lib/{abi}/libksud.so"
+                  bundled = archive.read(entry)
+                  built = source.read_bytes()
+                  if bundled != built:
+                      raise SystemExit(
+                          f"{entry} mismatch: bundled={hashlib.sha256(bundled).hexdigest()} "
+                          f"built={hashlib.sha256(built).hexdigest()}"
+                      )
+                  print(f"{entry}: {hashlib.sha256(built).hexdigest()}")
+          PY
 
       - name: Check the APK is the manager the modules look for
+        if: env.MANAGER_BUILD_ALLOWED == 'true'
         run: |
           set -euo pipefail
           apk=$(find dist -name '*.apk' -type f | head -n 1)
@@ -220,6 +333,7 @@ jobs:
             echo "::error::labelled '$label', expected '$MANAGER_NAME'"; exit 1; }
 
       - name: Check the APK is signed with the certificate the modules trust
+        if: env.MANAGER_BUILD_ALLOWED == 'true'
         env:
           STORE_FILE: ${{ secrets.STORE_FILE }}
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
@@ -272,17 +386,60 @@ jobs:
           done
           echo "ksud carries the soft-reboot reaper and explicit late-load module compatibility"
 
+      - name: Verify the selected target daemon variant
+        if: env.MANAGER_BUILD_ALLOWED != 'true'
+        run: |
+          set -euo pipefail
+          case "$KSU_PATCH_VARIANT" in
+            asteroids)
+              markers=(
+                'Asteroids late-load: recreating zygote-start boundary'
+                'Asteroids late-load: Vector root daemon socket registered'
+                'Asteroids late-load: KernelSU Manager restarted after late-load'
+              )
+              ;;
+            oneplus-pad3)
+              markers=(
+                'OnePlus Pad 3 late-load: replacement system_server verified before exact-once service stage'
+                'OnePlus Pad 3 late-load: trusted root-private completion receipt committed after SELinux enforcing readback'
+                'trusted staged-daemon path was not supplied by the late-load helper'
+              )
+              ;;
+            *)
+              echo "::error::unexpected validation-only variant: $KSU_PATCH_VARIANT"
+              exit 1
+              ;;
+          esac
+          for marker in "${markers[@]}"; do
+            grep -qa "$marker" target/aarch64-linux-android/release/ksud || {
+              echo "::error::$KSU_PATCH_VARIANT ksud is missing marker: $marker"
+              exit 1
+            }
+          done
+          echo "::notice::$KSU_PATCH_VARIANT source and ksud validation passed"
+          echo "::notice::no Manager APK is produced here; the consuming target must embed its exact LKM and use its own accepted signer"
+
       - name: Upload the manager
+        if: env.MANAGER_BUILD_ALLOWED == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: manager-witaqua-${{ env.KSU_VERSION }}
-          path: kernelsu/dist/*.apk
+          name: manager-witaqua-${{ env.KSU_VERSION }}-${{ env.KSU_PATCH_VARIANT }}
+          path: |
+            kernelsu/dist/*.apk
+            variant-manifest.txt
+
+      - name: Upload the target-variant validation manifest
+        if: env.MANAGER_BUILD_ALLOWED != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: validation-${{ env.KSU_VERSION }}-${{ env.KSU_PATCH_VARIANT }}
+          path: variant-manifest.txt
 
       # Everything above has run and passed by now, so what this adds is only
       # the decision to publish -- which is a person's, because the target's
       # kernelsu.json sends people here to install it.
       - name: Publish a release
-        if: ${{ inputs.release }}
+        if: ${{ inputs.release && env.MANAGER_BUILD_ALLOWED == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -291,11 +448,11 @@ jobs:
           # already says which upstream revision this is, and the upstream sha
           # does not move when the patches do -- a second release of the same
           # version would collide with the first, which is how this was found.
-          tag="manager-${KSU_VERSION}-${GITHUB_SHA::7}"
+          tag="manager-${KSU_VERSION}-${KSU_PATCH_VARIANT}-${GITHUB_SHA::7}"
 
           cat > notes.md <<NOTES
-          Upstream KernelSU $KSU_VERSION with this repository's \`common\` patch
-          set applied to ksud, renamed to **$MANAGER_NAME**
+          Upstream KernelSU $KSU_VERSION with this repository's
+          \`$KSU_PATCH_VARIANT\` patch variant applied to ksud, renamed to **$MANAGER_NAME**
           (\`$MANAGER_PACKAGE\`) and signed with the WitAqua key.
 
           Its bundled ksud is the point: opening the official manager rewrites
@@ -310,7 +467,7 @@ jobs:
           NOTES
           sed -i 's/^          //' notes.md
 
-          gh release create "$tag" dist/*.apk \
+          gh release create "$tag" dist/*.apk "$GITHUB_WORKSPACE/variant-manifest.txt" \
             --repo "$GITHUB_REPOSITORY" \
             --title "KernelSU manager $KSU_VERSION (WitAqua)" \
             --notes-file notes.md

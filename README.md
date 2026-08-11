@@ -97,7 +97,7 @@ either always applied or named by the build that wants it:
 | `common/` | every build, always, first | what no target can boot without |
 | `galaxy/` | builds that name it | Samsung KDP / RKP / DEFEX |
 | `oppo/` | builds that name it | OPPO, OnePlus and realme — [empty today](patches/32525/oppo/README.md) |
-| `devices/<id>/` | the one build that names it | what nothing else can use — [`quest3` today](patches/32525/devices/README.md) |
+| `devices/<id>/` | the one build that names it | target-only kernel or userspace behavior — [current sets](patches/32525/devices/README.md) |
 
 Within a set the patches apply in filename order, hence the `NNNN-` prefixes.
 The sets apply in the order `common`, then whatever the build named, in the
@@ -207,20 +207,28 @@ leaving stale daemons behind, with nothing in any log to say the daemon had
 been replaced. A soft restart is the only restart such a device has, so that is
 the normal path rather than a corner case.
 
-The **Manager** workflow builds one whose bundled `ksud` is already the patched
-one, under a name of its own — **Root My Device KSU**,
-`org.witaqua.pwn.kernelsu`. It checks out upstream at the revision the patches
-were written against, applies `common` to the working tree, builds `ksud` for
-`aarch64` and `x86_64`,
-lets Gradle build the APK and `repack_apk.py` put that `ksud` into it, and
-signs the result. Nothing is forked and nothing is committed on top of
-upstream, so `git rev-list --count HEAD` is still upstream's and the manager's
-`versionCode` matches the module Root-My-Device-Payloads builds.
+The **Manager** workflow builds the common-only Manager under a name of its own
+— **Root My Device KSU**, `org.witaqua.pwn.kernelsu`. It checks out upstream at
+the revision the patches were written against, applies `common`, builds `ksud`
+for `aarch64` and `x86_64`, lets Gradle build the APK and `repack_apk.py` put
+that `ksud` into it, and signs the result. Nothing is forked and nothing is
+committed on top of upstream, so `git rev-list --count HEAD` is still
+upstream's and the manager's `versionCode` matches the module build.
 
-Only `common` goes in. The sets a target names on top of it are kernel-side, so
-a manager built from `common` alone carries the same daemon every target's
-build does; a userspace patch landing in a non-common set would break that, and
-the workflow is where to notice.
+That APK is valid only for builds whose selected sets do not change userspace.
+Both `devices/asteroids` and `devices/oneplus-pad3` change `ksud`; either target
+therefore needs a Manager built from the exact same ordered patch sets. The
+workflow exposes those two variants as validation-only choices: it applies the
+series and builds both daemon architectures, but deliberately emits no APK.
+The consuming Nothing or OnePlus build must add its exact LKM, bundle the
+resulting target daemon, and sign both module identity and Manager with the
+certificate that target accepts.
+
+This is an operational safety boundary, not merely an artifact filename. Two
+APKs with the same package, certificate and versionCode can replace each other,
+and KernelSU authenticates the package/certificate rather than a patch variant.
+A common-only or wrong-target Manager must never be offered to a target whose
+device set changes userspace.
 
 **It is the only manager the modules accept.** Root-My-Device-Payloads builds
 them with this certificate as `KSU_EXPECTED_HASH` — upstream's default,
@@ -247,12 +255,11 @@ fail silently on a device:
 - **the bundled `ksud` really carries the patches**, by a string only
   `common/0004` adds.
 
-**Nothing runs it on a push.** Start it from the Actions tab; leaving the
-release box alone is the check, since it builds the manager and runs every
-assertion above without publishing anything. That is what to do after changing
-a `common` patch, and it is also why a push trigger would be waste — the APK a
-push produced was thrown away, and a patch that lands is followed by a release
-run anyway.
+**Nothing runs it on a push.** Start it from the Actions tab. `common` builds
+and checks an APK; `asteroids` and `oneplus-pad3` validate their full daemon
+series without producing an installable Manager. Publishing is accepted only
+for `common`. Target-specific signed Managers come from their consuming build,
+where the signer and embedded LKM can be checked together.
 
 It builds whatever `ksu_ref` says, defaulting to the pinned revision. A run
 after editing some *other* version's `common/` therefore says nothing about
