@@ -10,7 +10,7 @@ to only one of them could not be honoured. A delta that genuinely applies to one
 of them and not the other means they are different modules and want different
 ids.
 
-There are currently three device sets, `quest3`, `asteroids` and
+There are currently three device sets, `quest3`, `asteroids`, and
 `oneplus-pad3`, and the list
 should stay small. A patch here is one nothing else can use, so reach for it
 only after `common` and the vendor sets have been ruled out. As with any set, a
