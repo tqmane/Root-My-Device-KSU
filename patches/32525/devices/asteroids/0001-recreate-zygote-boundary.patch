@@ -1,7 +1,7 @@
 diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
 --- a/userspace/ksud/src/late_load.rs
 +++ b/userspace/ksud/src/late_load.rs
-@@ -1,10 +1,73 @@
+@@ -1,10 +1,72 @@
  use anyhow::{Context, Result};
  use log::{info, warn};
  use rustix::cstr;
@@ -26,8 +26,7 @@ diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
 +fn restart_zygote_for_late_modules() -> Result<()> {
 +    let old_system_server = process_id("system_server");
 +    info!(
-+        "Asteroids late-load: recreating zygote-start boundary (old system_server={:?})",
-+        old_system_server
++        "Asteroids late-load: recreating zygote-start boundary (old system_server={old_system_server:?})"
 +    );
 +
 +    let status = Command::new("/system/bin/setprop")
@@ -46,8 +45,7 @@ diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
 +            && (old_system_server.is_none() || new_system_server != old_system_server);
 +        if zygote_running && system_server_replaced {
 +            info!(
-+                "Asteroids late-load: zygote/system_server restarted (system_server={:?})",
-+                new_system_server
++                "Asteroids late-load: zygote/system_server restarted (system_server={new_system_server:?})"
 +            );
 +            thread::sleep(Duration::from_millis(500));
 +            return Ok(());
@@ -63,7 +61,8 @@ diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
 +    const MARKER: &str = "/data/local/tmp/.ksu-late-load-modules-ok";
 +    const TEMP: &str = "/data/local/tmp/.ksu-late-load-modules-ok.tmp";
 +
-+    let boot_id = fs::read_to_string(BOOT_ID).context("failed to read boot_id for module marker")?;
++    let boot_id =
++        fs::read_to_string(BOOT_ID).context("failed to read boot_id for module marker")?;
 +    fs::write(TEMP, boot_id.as_bytes()).context("failed to write temporary module marker")?;
 +    fs::set_permissions(TEMP, fs::Permissions::from_mode(0o644))
 +        .context("failed to chmod module marker")?;
@@ -75,7 +74,7 @@ diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
  fn dump_process_info(label: &str) {
      use rustix::process::{getgid, getgroups, getpid, getuid};
  
-@@ -189,14 +252,23 @@
+@@ -189,14 +251,23 @@
          init_event::run_stage("post-mount", true);
      }
  
