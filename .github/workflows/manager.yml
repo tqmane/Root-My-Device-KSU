@@ -62,17 +62,6 @@ env:
   MANAGER_NAME: Root My Device KSU
   EXPECTED_CERT_SHA256: 892ea55bd3eeca03d97d52e73c3c16cb3e0ad13f571cdbce8394035249b57002
   EXPECTED_CERT_SIZE: 804
-  # What the module can physically read. kernel/manager/apk_sign.c reads the
-  # certificate into a fixed buffer before hashing it:
-  #
-  #     #define CERT_MAX_LENGTH 1024
-  #     if (*size4 > CERT_MAX_LENGTH) { pr_info("cert length overlimit"); return false; }
-  #
-  # A longer certificate is not rejected loudly on a device -- is_manager stays
-  # 0 and nothing else is said. The first key here was RSA-4096, 1316 bytes,
-  # and no module ever recognised the manager it signed. Checked here so that
-  # cannot happen again in silence.
-  CERT_MAX_LENGTH: 1024
 
 jobs:
   manager:
@@ -275,11 +264,13 @@ jobs:
           set -euo pipefail
           # Cheap proof that the APK really carries the patched daemon rather
           # than an upstream one: the string only this patch adds.
-          if ! grep -qa 'leftover module daemon' target/aarch64-linux-android/release/ksud; then
-            echo "::error::the built ksud does not carry common/0004; the patch set did not land"
-            exit 1
-          fi
-          echo "ksud carries the soft-reboot reaper"
+          for marker in 'leftover module daemon' 'late-load compatibility'; do
+            if ! grep -qa "$marker" target/aarch64-linux-android/release/ksud; then
+              echo "::error::the built ksud is missing patch marker: $marker"
+              exit 1
+            fi
+          done
+          echo "ksud carries the soft-reboot reaper and explicit late-load module compatibility"
 
       - name: Upload the manager
         uses: actions/upload-artifact@v7
