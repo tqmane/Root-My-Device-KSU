@@ -21,9 +21,9 @@ name: Manager
 #
 # The bundled ksud carries no LKM. Root-My-Device loads the module with its own
 # ksud. This manager is here to keep the daemon on the device patched, not to
-# install KernelSU. Device patch sets that modify userspace must be selected
-# explicitly so the Manager cannot replace a target daemon with a common-only
-# one.
+# install KernelSU. Device patch sets that modify userspace are validation-only
+# here; their consuming target must build the installable Manager from the same
+# ordered series, exact LKM and accepted signer.
 #
 # Hand-started only, and it publishes only with the box ticked. Leaving the box
 # alone is the check -- it builds the manager and runs every assertion on it
@@ -49,7 +49,7 @@ on:
           - oneplus-pad3
         default: common
       release:
-        description: publish a GitHub release as well as an artifact
+        description: publish the common-only Manager release as well as its artifact
         type: boolean
         default: false
 
@@ -72,6 +72,7 @@ env:
   MANAGER_NAME: Root My Device KSU
   EXPECTED_CERT_SHA256: 892ea55bd3eeca03d97d52e73c3c16cb3e0ad13f571cdbce8394035249b57002
   EXPECTED_CERT_SIZE: 804
+  CERT_MAX_LENGTH: 1024
 
 jobs:
   manager:
@@ -206,6 +207,7 @@ jobs:
           KSU_PACKAGE_NAME: ${{ env.MANAGER_PACKAGE }}
         run: |
           set -euo pipefail
+          cargo fmt --all -- --check
           for triple in aarch64-linux-android x86_64-linux-android; do
             # shellcheck disable=SC1091
             source .github/scripts/setup-rust-build.sh "$triple" 26
