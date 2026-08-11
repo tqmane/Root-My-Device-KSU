@@ -77,10 +77,11 @@ env:
 jobs:
   manager:
     runs-on: ubuntu-latest
-    # Only for the release step; the rest of the run needs nothing but a
-    # checkout.
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      ksu_version: ${{ steps.patch_series.outputs.ksu_version }}
+      patch_variant: ${{ steps.patch_series.outputs.patch_variant }}
     # Everything after the two checkouts happens in the KernelSU tree: its
     # gradle project, its repack script, its cargo workspace.
     defaults:
@@ -88,19 +89,22 @@ jobs:
         working-directory: kernelsu
     steps:
       - name: Check out the patch sets
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           path: patches-repo
+          persist-credentials: false
 
       - name: Check out KernelSU at the revision the patches were written against
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: tiann/KernelSU
           ref: ${{ inputs.ksu_ref || 'b0bc817b4e966aa6aa830834eaf6ef765d821d40' }}
           path: kernelsu
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Apply the selected patch sets
+        id: patch_series
         env:
           REQUESTED_VARIANT: ${{ inputs.variant || 'common' }}
           PUBLISH_RELEASE: ${{ inputs.release || false }}
@@ -165,21 +169,23 @@ jobs:
           git diff --check
           echo "KSU_PATCH_VARIANT=$REQUESTED_VARIANT" >> "$GITHUB_ENV"
           echo "MANAGER_BUILD_ALLOWED=$manager_build_allowed" >> "$GITHUB_ENV"
+          echo "ksu_version=$version" >> "$GITHUB_OUTPUT"
+          echo "patch_variant=$REQUESTED_VARIANT" >> "$GITHUB_OUTPUT"
           echo "Manager patch variant: $REQUESTED_VARIANT"
 
       - name: Set up Java
         if: env.MANAGER_BUILD_ALLOWED == 'true'
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: 21
 
-      - uses: gradle/actions/setup-gradle@v6
+      - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6
         if: env.MANAGER_BUILD_ALLOWED == 'true'
 
       - name: Set up the Android SDK
         if: env.MANAGER_BUILD_ALLOWED == 'true'
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
 
       - name: Set up build-tools
         if: env.MANAGER_BUILD_ALLOWED == 'true'
@@ -192,11 +198,11 @@ jobs:
           rustup update stable
           rustup target add aarch64-linux-android x86_64-linux-android
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: kernelsu/userspace/ksud
 
-      - uses: nttld/setup-ndk@v1
+      - uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
         id: ndk
         with:
           ndk-version: r29
@@ -423,7 +429,7 @@ jobs:
 
       - name: Upload the manager
         if: env.MANAGER_BUILD_ALLOWED == 'true'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: manager-witaqua-${{ env.KSU_VERSION }}-${{ env.KSU_PATCH_VARIANT }}
           path: |
@@ -432,44 +438,62 @@ jobs:
 
       - name: Upload the target-variant validation manifest
         if: env.MANAGER_BUILD_ALLOWED != 'true'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: validation-${{ env.KSU_VERSION }}-${{ env.KSU_PATCH_VARIANT }}
           path: variant-manifest.txt
 
-      # Everything above has run and passed by now, so what this adds is only
-      # the decision to publish -- which is a person's, because the target's
-      # kernelsu.json sends people here to install it.
-      - name: Publish a release
-        if: ${{ inputs.release && env.MANAGER_BUILD_ALLOWED == 'true' }}
+  release:
+    if: ${{ inputs.release && inputs.variant == 'common' }}
+    needs: manager
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the verified common Manager
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: manager-witaqua-${{ needs.manager.outputs.ksu_version }}-${{ needs.manager.outputs.patch_variant }}
+          path: release-artifact
+
+      - name: Publish the verified common Manager
         env:
           GH_TOKEN: ${{ github.token }}
+          KSU_VERSION: ${{ needs.manager.outputs.ksu_version }}
+          KSU_PATCH_VARIANT: ${{ needs.manager.outputs.patch_variant }}
         run: |
           set -euo pipefail
-          # This repository's sha, not the KernelSU checkout's. The version
-          # already says which upstream revision this is, and the upstream sha
-          # does not move when the patches do -- a second release of the same
-          # version would collide with the first, which is how this was found.
-          tag="manager-${KSU_VERSION}-${KSU_PATCH_VARIANT}-${GITHUB_SHA::7}"
+          [ "$KSU_PATCH_VARIANT" = common ] || {
+            echo "::error::only the common Manager may be published by this workflow"; exit 1; }
+          mapfile -t apks < <(find release-artifact -type f -name '*.apk' -print)
+          mapfile -t manifests < <(find release-artifact -type f -name 'variant-manifest.txt' -print)
+          [ "${#apks[@]}" -eq 1 ] && [ "${#manifests[@]}" -eq 1 ] || {
+            echo "::error::release artifact must contain exactly one APK and one manifest"; exit 1; }
+          apk=${apks[0]}
+          manifest=${manifests[0]}
+          test -f "$apk" && test ! -L "$apk" || {
+            echo "::error::Manager artifact is not a regular non-symlink file"; exit 1; }
+          test -f "$manifest" && test ! -L "$manifest" || {
+            echo "::error::variant manifest is not a regular non-symlink file"; exit 1; }
+          grep -Fxq "ksu_version=$KSU_VERSION" "$manifest"
+          grep -Fxq 'variant=common' "$manifest"
+          grep -Fxq 'installable_manager=true' "$manifest"
+          grep -Fxq "rmd_sha=$GITHUB_SHA" "$manifest"
 
+          tag="manager-${KSU_VERSION}-${KSU_PATCH_VARIANT}-${GITHUB_SHA::7}"
           cat > notes.md <<NOTES
-          Upstream KernelSU $KSU_VERSION with this repository's
-          \`$KSU_PATCH_VARIANT\` patch variant applied to ksud, renamed to **$MANAGER_NAME**
+          Upstream KernelSU $KSU_VERSION with this repository's \`common\`
+          patch set applied to ksud, renamed to **$MANAGER_NAME**
           (\`$MANAGER_PACKAGE\`) and signed with the WitAqua key.
 
-          Its bundled ksud is the point: opening the official manager rewrites
-          \`/data/adb/ksud\` with the copy inside its own APK, which reverts
-          those patches on a device Root-My-Device rooted.
-
-          **This is the only manager the modules accept.** They are built with
-          this certificate as the one they look for and with the package name
-          above pinned, so the official manager is not rejected on such a
-          device -- it is never found. Both can be installed at once; only this
-          one is a manager.
+          This APK is for common-compatible builds compiled to accept that
+          package and certificate. Targets whose device patch set changes
+          userspace must use the signer-matched Manager produced by their own
+          consuming build; this common Manager is not interchangeable.
           NOTES
           sed -i 's/^          //' notes.md
 
-          gh release create "$tag" dist/*.apk "$GITHUB_WORKSPACE/variant-manifest.txt" \
+          gh release create "$tag" "$apk" "$manifest" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "KernelSU manager $KSU_VERSION (WitAqua)" \
+            --title "KernelSU manager $KSU_VERSION common (WitAqua)" \
             --notes-file notes.md

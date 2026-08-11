@@ -230,12 +230,14 @@ and KernelSU authenticates the package/certificate rather than a patch variant.
 A common-only or wrong-target Manager must never be offered to a target whose
 device set changes userspace.
 
-**It is the only manager the modules accept.** Root-My-Device-Payloads builds
-them with this certificate as `KSU_EXPECTED_HASH` — upstream's default,
-replaced rather than added to — and with `KSU_MANAGER_PACKAGE` pinned to the
-name above. The official manager is not refused on such a device; it is never
-found, which is the point: it cannot rewrite `/data/adb/ksud` if the kernel
-does not consider it a manager. Both can be installed at once.
+For modules built with the shared WitAqua identity, **it is the only manager
+those modules accept**. Root-My-Device-Payloads builds them with this
+certificate as `KSU_EXPECTED_HASH` — upstream's default, replaced rather than
+added to — and with `KSU_MANAGER_PACKAGE` pinned to the name above. A consuming
+target that uses another signer, such as a local OnePlus build, accepts only
+the Manager that same consuming build produces. The official manager is not
+refused on such a device; it is never found, which is the point: it cannot
+rewrite `ksud` if the kernel does not consider it a manager.
 
 Three things are checked before the APK is worth anything, because all three
 fail silently on a device:
@@ -254,6 +256,13 @@ fail silently on a device:
   the key rather than trusted;
 - **the bundled `ksud` really carries the patches**, by a string only
   `common/0004` adds.
+
+The workflow also records the RMD commit, upstream KernelSU pin and version,
+variant, ordered patch SHA-256 list, both built daemon SHA-256 values, Manager
+package and expected certificate in `variant-manifest.txt`. For an installable
+common Manager it compares both bundled `libksud.so` files byte-for-byte with
+the daemons built in that run. Target-specific validation uploads only the
+manifest; it never uploads or releases an APK.
 
 **Nothing runs it on a push.** Start it from the Actions tab. `common` builds
 and checks an APK; `asteroids` and `oneplus-pad3` validate their full daemon
