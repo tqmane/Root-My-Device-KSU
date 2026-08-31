@@ -38,7 +38,7 @@ on:
       ksu_ref:
         description: KernelSU revision to build, and the one the patches must apply to
         required: true
-        default: b0bc817b4e966aa6aa830834eaf6ef765d821d40
+        default: 932014ab5b2c9b74a3d11e2ec4d17dd10fc9442e
       variant:
         description: Patch variant to validate; only common produces an installable Manager here
         required: true
@@ -64,10 +64,10 @@ permissions:
 # with nothing in the log to say why. Checked here rather than discovered on a
 # device.
 env:
-  # What the manager is called on the device. From 32567 upstream reads both
-  # from gradle properties and ksud from an environment variable; before that
-  # the patch set hardcodes them, and passing them anyway is harmless. Either
-  # way the APK is checked for them below rather than trusted to have them.
+  # What the manager is called on the device. KernelSU 32601 exposes the
+  # manager package/name as build properties; the 32601 common rebrand patch
+  # changes their defaults, while these explicit values keep CI and consuming
+  # device builds on the same identity.
   MANAGER_PACKAGE: org.witaqua.pwn.kernelsu
   MANAGER_NAME: Root My Device KSU
   EXPECTED_CERT_SHA256: 892ea55bd3eeca03d97d52e73c3c16cb3e0ad13f571cdbce8394035249b57002
@@ -98,7 +98,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: tiann/KernelSU
-          ref: ${{ inputs.ksu_ref || 'b0bc817b4e966aa6aa830834eaf6ef765d821d40' }}
+          ref: ${{ inputs.ksu_ref || '932014ab5b2c9b74a3d11e2ec4d17dd10fc9442e' }}
           path: kernelsu
           fetch-depth: 0
           persist-credentials: false
