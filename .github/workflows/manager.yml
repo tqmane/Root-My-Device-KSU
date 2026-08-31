@@ -1,7 +1,7 @@
 name: Manager
 
 # The KernelSU manager, built with the patches in this repository applied to
-# ksud and signed with the WitAqua key.
+# ksud and signed with the configured Root My Device release key.
 #
 # Why it exists: the manager rewrites /data/adb/ksud with the copy bundled in
 # its own APK the first time it runs. On a device rooted by Root-My-Device that
@@ -56,13 +56,11 @@ on:
 permissions:
   contents: read
 
-# The certificate the modules are built to trust, from
-# Android-Keys/kernelsu-manager. KernelSU's module picks its manager by hashing
-# the APK's v2 signing certificate and comparing it against EXPECTED_SIZE /
-# EXPECTED_HASH compiled in, so an APK signed with anything else is not a
-# manager as far as the kernel is concerned -- it just fails to be recognised,
-# with nothing in the log to say why. Checked here rather than discovered on a
-# device.
+# KernelSU picks its manager by the APK signing certificate. The workflow
+# derives the certificate hash and DER size from ROOT_MY_DEVICE_KEYSTORE_B64 at
+# build time instead of hard-coding a repository-specific signer. Consuming
+# Root-My-Device builds must use the same key when compiling KSU_EXPECTED_HASH /
+# KSU_EXPECTED_SIZE.
 env:
   # What the manager is called on the device. KernelSU 32601 exposes the
   # manager package/name as build properties; the 32601 common rebrand patch
@@ -70,8 +68,6 @@ env:
   # device builds on the same identity.
   MANAGER_PACKAGE: org.witaqua.pwn.kernelsu
   MANAGER_NAME: Root My Device KSU
-  EXPECTED_CERT_SHA256: 892ea55bd3eeca03d97d52e73c3c16cb3e0ad13f571cdbce8394035249b57002
-  EXPECTED_CERT_SIZE: 804
   CERT_MAX_LENGTH: 1024
 
 jobs:
@@ -221,6 +217,51 @@ jobs:
               --manifest-path ./userspace/ksud/Cargo.toml
           done
 
+      - name: Materialize and validate the signing key
+        if: env.MANAGER_BUILD_ALLOWED == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.ROOT_MY_DEVICE_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.ROOT_MY_DEVICE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ROOT_MY_DEVICE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ROOT_MY_DEVICE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in KEYSTORE_B64 STORE_PASSWORD KEY_ALIAS; do
+            [ -n "${!name:-}" ] || {
+              echo "::error::missing Actions secret for $name"
+              echo "::error::configure ROOT_MY_DEVICE_KEYSTORE_B64, ROOT_MY_DEVICE_STORE_PASSWORD and ROOT_MY_DEVICE_KEY_ALIAS in this repository"
+              exit 1
+            }
+          done
+          key_password=${KEY_PASSWORD:-$STORE_PASSWORD}
+
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > key.jks
+          chmod 600 key.jks
+          [ -s key.jks ] || { echo "::error::decoded keystore is empty"; exit 1; }
+
+          # Validate the store/alias now and derive the exact certificate pair
+          # KernelSU modules must be compiled to accept.
+          keytool -list -keystore key.jks -storepass "$STORE_PASSWORD" \
+            -alias "$KEY_ALIAS" >/dev/null
+          keytool -exportcert -keystore key.jks -storepass "$STORE_PASSWORD" \
+            -alias "$KEY_ALIAS" -file cert.der >/dev/null
+          cert_sha=$(sha256sum cert.der | awk '{print $1}')
+          cert_size=$(stat -c%s cert.der)
+          [ "$cert_size" -le "$CERT_MAX_LENGTH" ] || {
+            echo "::error::signing certificate is $cert_size bytes; KernelSU limit is $CERT_MAX_LENGTH"
+            exit 1
+          }
+          echo "Manager signer: $cert_sha ($cert_size bytes DER)"
+          echo "EXPECTED_CERT_SHA256=$cert_sha" >> "$GITHUB_ENV"
+          echo "EXPECTED_CERT_SIZE=$cert_size" >> "$GITHUB_ENV"
+
+          {
+            echo "KEYSTORE_FILE=$PWD/key.jks"
+            echo "KEYSTORE_PASSWORD=$STORE_PASSWORD"
+            echo "KEY_ALIAS=$KEY_ALIAS"
+            echo "KEY_PASSWORD=$key_password"
+          } >> manager/gradle.properties
+
       - name: Record the exact daemon variant
         run: |
           set -euo pipefail
@@ -242,29 +283,14 @@ jobs:
             echo "installable_manager=$MANAGER_BUILD_ALLOWED"
             echo "manager_package=$MANAGER_PACKAGE"
             echo "manager_certificate_sha256=$signer"
+            if [ "$MANAGER_BUILD_ALLOWED" = true ]; then
+              echo "manager_certificate_size=$EXPECTED_CERT_SIZE"
+            fi
             echo "ksud_arm64_sha256=$arm64_sha"
             echo "ksud_x86_64_sha256=$x86_64_sha"
             sed 's/^/patch_sha256=/' "$GITHUB_WORKSPACE/applied-patches.txt"
           } > "$GITHUB_WORKSPACE/variant-manifest.txt"
           cat "$GITHUB_WORKSPACE/variant-manifest.txt"
-
-      - name: Write the signing key
-        if: env.MANAGER_BUILD_ALLOWED == 'true'
-        env:
-          STORE_FILE: ${{ secrets.STORE_FILE }}
-          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          test -n "$STORE_FILE" || { echo "::error::STORE_FILE is not set"; exit 1; }
-          printf '%s' "$STORE_FILE" | base64 -d > key.jks
-          {
-            echo "KEYSTORE_FILE=$PWD/key.jks"
-            echo "KEYSTORE_PASSWORD=$STORE_PASSWORD"
-            echo "KEY_ALIAS=$KEY_ALIAS"
-            echo "KEY_PASSWORD=$KEY_PASSWORD"
-          } >> manager/gradle.properties
 
       - name: Build the manager
         if: env.MANAGER_BUILD_ALLOWED == 'true'
@@ -278,15 +304,16 @@ jobs:
       - name: Repack with the patched ksud and re-sign
         if: env.MANAGER_BUILD_ALLOWED == 'true'
         env:
-          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.ROOT_MY_DEVICE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ROOT_MY_DEVICE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ROOT_MY_DEVICE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          key_password=${KEY_PASSWORD:-$STORE_PASSWORD}
           python3 repack_apk.py repack \
             -b release -t release \
             -a arm64-v8a -a x86_64 \
-            -K key.jks -A "$KEY_ALIAS" -P "$STORE_PASSWORD" -S "$KEY_PASSWORD" \
+            -K key.jks -A "$KEY_ALIAS" -P "$STORE_PASSWORD" -S "$key_password" \
             -n "RootMyDeviceKSU_${KSU_VERSION}_${KSU_PATCH_VARIANT}"
 
       - name: Check the Manager bundles this run's exact daemons
@@ -340,12 +367,8 @@ jobs:
           [ "$label" = "$MANAGER_NAME" ] || {
             echo "::error::labelled '$label', expected '$MANAGER_NAME'"; exit 1; }
 
-      - name: Check the APK is signed with the certificate the modules trust
+      - name: Check the APK is signed with the configured certificate
         if: env.MANAGER_BUILD_ALLOWED == 'true'
-        env:
-          STORE_FILE: ${{ secrets.STORE_FILE }}
-          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
           set -euo pipefail
           apk=$(find dist -name '*.apk' -type f | head -n 1)
@@ -358,28 +381,17 @@ jobs:
           if [ -z "$got" ]; then
             echo "$certs"; echo "::error::apksigner printed no certificate digest"; exit 1
           fi
-
-          if [ "$got" != "$EXPECTED_CERT_SHA256" ]; then
-            echo "::error::signed with $got, but the modules are built to trust $EXPECTED_CERT_SHA256"
-            echo "::error::either the wrong key is in the secrets, or every module carrying the old pair has to be rebuilt"
+          [ "$got" = "$EXPECTED_CERT_SHA256" ] || {
+            echo "::error::APK signer $got does not match configured key $EXPECTED_CERT_SHA256"
             exit 1
-          fi
+          }
 
-          # The size is the other half of the pair, and the half with a ceiling.
-          # Read it off the key rather than trusting the number above.
-          printf '%s' "$STORE_FILE" | base64 -d > check.jks
-          keytool -exportcert -alias "$KEY_ALIAS" -keystore check.jks \
-            -storepass "$STORE_PASSWORD" -file cert.der 2>/dev/null
           size=$(stat -c%s cert.der)
-          rm -f check.jks cert.der
           echo "certificate: $got, $size bytes of DER"
           [ "$size" = "$EXPECTED_CERT_SIZE" ] || {
-            echo "::error::the certificate is $size bytes, not $EXPECTED_CERT_SIZE"; exit 1; }
-          if [ "$size" -gt "$CERT_MAX_LENGTH" ]; then
-            echo "::error::$size bytes is past CERT_MAX_LENGTH ($CERT_MAX_LENGTH), so no module can"
-            echo "::error::read this certificate at all -- it would be is_manager: 0 and silence"
-            exit 1
-          fi
+            echo "::error::certificate changed during build: $size != $EXPECTED_CERT_SIZE"; exit 1; }
+          [ "$size" -le "$CERT_MAX_LENGTH" ] || {
+            echo "::error::$size bytes is past KernelSU CERT_MAX_LENGTH ($CERT_MAX_LENGTH)"; exit 1; }
 
       - name: Verify the reap patch is in the bundled ksud
         run: |
@@ -431,7 +443,7 @@ jobs:
         if: env.MANAGER_BUILD_ALLOWED == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: manager-witaqua-${{ env.KSU_VERSION }}-${{ env.KSU_PATCH_VARIANT }}
+          name: manager-root-my-device-${{ env.KSU_VERSION }}-${{ env.KSU_PATCH_VARIANT }}
           path: |
             kernelsu/dist/*.apk
             variant-manifest.txt
@@ -453,7 +465,7 @@ jobs:
       - name: Download the verified common Manager
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: manager-witaqua-${{ needs.manager.outputs.ksu_version }}-${{ needs.manager.outputs.patch_variant }}
+          name: manager-root-my-device-${{ needs.manager.outputs.ksu_version }}-${{ needs.manager.outputs.patch_variant }}
           path: release-artifact
 
       - name: Publish the verified common Manager
@@ -484,7 +496,7 @@ jobs:
           cat > notes.md <<NOTES
           Upstream KernelSU $KSU_VERSION with this repository's \`common\`
           patch set applied to ksud, renamed to **$MANAGER_NAME**
-          (\`$MANAGER_PACKAGE\`) and signed with the WitAqua key.
+          (\`$MANAGER_PACKAGE\`) and signed with the configured Root My Device release key.
 
           This APK is for common-compatible builds compiled to accept that
           package and certificate. Targets whose device patch set changes
@@ -495,5 +507,5 @@ jobs:
 
           gh release create "$tag" "$apk" "$manifest" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "KernelSU manager $KSU_VERSION common (WitAqua)" \
+            --title "Root My Device KSU manager $KSU_VERSION common" \
             --notes-file notes.md
