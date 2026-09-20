@@ -40,7 +40,15 @@ jobs:
             test -d "$set_dir"
             for patch in "$set_dir"/*.patch; do
               echo "-- $set_name/$(basename "$patch")"
-              git apply --check "$patch"
+              if ! git apply --check "$patch"; then
+                echo "=== verbose apply failure ==="
+                git apply --check --verbose "$patch" || true
+                echo "=== late_load.rs around Vector cleanup ==="
+                nl -ba userspace/ksud/src/late_load.rs | sed -n '145,225p'
+                echo "=== late_load.rs around framework helpers ==="
+                nl -ba userspace/ksud/src/late_load.rs | sed -n '315,390p'
+                exit 1
+              fi
               git apply "$patch"
             done
           done
