@@ -1,3 +1,4 @@
+# Temporary validation workflow; never merge this file.
 name: Validate Asteroids patch series
 
 on:
