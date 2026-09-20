@@ -66,71 +66,67 @@ diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
 +    restart_manager_after_late_load(package_name);
 +
      Ok(())
+@@ -531,5 +587,50 @@ fn verify_vector_framework_cli() -> Result<()> {
+     append_module_lifecycle_log("Vector CLI framework health verified");
+     Ok(())
+ }
+ 
++/// Re-run the Asteroids module service lifecycle after KernelSU's emulated
++/// soft reboot. The kernel (and therefore KernelSU/su) survives that reboot,
++/// but zygote/system_server and module daemons do not. Running ordinary
++/// `on_services()` here would start Zygisk/Vector only after the replacement
++/// zygote already exists, so their providers never get a fresh zygote boundary.
++pub fn run_asteroids_soft_reboot_services() -> Result<()> {
++    reset_module_lifecycle_log();
++    let previous_system_server = process_id("system_server");
++    append_module_lifecycle_log(&format!(
++        "soft-reboot service lifecycle begin system_server={previous_system_server:?}"
++    ));
 +
-+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
-+--- a/userspace/ksud/src/late_load.rs
-++++ b/userspace/ksud/src/late_load.rs
-+@@ -531,5 +531,50 @@ fn verify_vector_framework_cli() -> Result<()> {
-+     append_module_lifecycle_log("Vector CLI framework health verified");
-+     Ok(())
-+ }
-+ 
-++/// Re-run the Asteroids module service lifecycle after KernelSU's emulated
-++/// soft reboot. The kernel (and therefore KernelSU/su) survives that reboot,
-++/// but zygote/system_server and module daemons do not. Running ordinary
-++/// `on_services()` here would start Zygisk/Vector only after the replacement
-++/// zygote already exists, so their providers never get a fresh zygote boundary.
-++pub fn run_asteroids_soft_reboot_services() -> Result<()> {
-++    reset_module_lifecycle_log();
-++    let previous_system_server = process_id("system_server");
-++    append_module_lifecycle_log(&format!(
-++        "soft-reboot service lifecycle begin system_server={previous_system_server:?}"
-++    ));
-++
-++    let service_result = (|| -> Result<()> {
-++        let vector_state = prepare_vector_service_stage()?;
-++        let verify_vector = match vector_state {
-++            VectorServiceState::Disabled => {
-++                init_event::run_stage("service", false);
-++                false
-++            }
-++            VectorServiceState::Running => {
-++                init_event::run_stage_excluding_module("service", false, "zygisk_vector");
-++                true
-++            }
-++            VectorServiceState::NeedsLaunch => {
-++                init_event::run_stage_excluding_module("service", false, "zygisk_vector");
-++                launch_vector_service_directly()?;
-++                anyhow::ensure!(wait_vector_root_daemon(1), "Vector socket disappeared after launch");
-++                true
-++            }
-++        };
-++        ensure_zygote_boundary_after_services(previous_system_server.as_ref())?;
-++        if verify_vector {
-++            verify_vector_framework_cli()?;
-++        }
-++        Ok(())
-++    })();
-++
-++    if let Err(error) = service_result {
-++        append_module_lifecycle_log(&format!("soft-reboot FAILED: {error:#}"));
-++        return Err(error);
-++    }
-++    append_module_lifecycle_log("soft-reboot service lifecycle verified");
-++    Ok(())
-++}
-++
-+ fn process_id(name: &str) -> Option<String> {
-+diff --git a/userspace/ksud/src/init_event.rs b/userspace/ksud/src/init_event.rs
-+--- a/userspace/ksud/src/init_event.rs
-++++ b/userspace/ksud/src/init_event.rs
-+@@ -286,7 +286,8 @@ pub fn soft_reboot() -> Result<()> {
-+         warn!("start exited with status: {status}");
-+     }
-+     info!("services");
-+-    on_services();
-++    crate::late_load::run_asteroids_soft_reboot_services()
-++        .context("Asteroids soft-reboot module service lifecycle failed")?;
-+     if let Err(e) = wait_for_boot_completed() {
-+         warn!("wait for boot completed failed: {e}");
-+     }
++    let service_result = (|| -> Result<()> {
++        let vector_state = prepare_vector_service_stage()?;
++        let verify_vector = match vector_state {
++            VectorServiceState::Disabled => {
++                init_event::run_stage("service", false);
++                false
++            }
++            VectorServiceState::Running => {
++                init_event::run_stage_excluding_module("service", false, "zygisk_vector");
++                true
++            }
++            VectorServiceState::NeedsLaunch => {
++                init_event::run_stage_excluding_module("service", false, "zygisk_vector");
++                launch_vector_service_directly()?;
++                anyhow::ensure!(wait_vector_root_daemon(1), "Vector socket disappeared after launch");
++                true
++            }
++        };
++        ensure_zygote_boundary_after_services(previous_system_server.as_ref())?;
++        if verify_vector {
++            verify_vector_framework_cli()?;
++        }
++        Ok(())
++    })();
++
++    if let Err(error) = service_result {
++        append_module_lifecycle_log(&format!("soft-reboot FAILED: {error:#}"));
++        return Err(error);
++    }
++    append_module_lifecycle_log("soft-reboot service lifecycle verified");
++    Ok(())
++}
++
+ fn process_id(name: &str) -> Option<String> {
+diff --git a/userspace/ksud/src/init_event.rs b/userspace/ksud/src/init_event.rs
+--- a/userspace/ksud/src/init_event.rs
++++ b/userspace/ksud/src/init_event.rs
+@@ -286,7 +286,8 @@ pub fn soft_reboot() -> Result<()> {
+         warn!("start exited with status: {status}");
+     }
+     info!("services");
+-    on_services();
++    crate::late_load::run_asteroids_soft_reboot_services()
++        .context("Asteroids soft-reboot module service lifecycle failed")?;
+     if let Err(e) = wait_for_boot_completed() {
+         warn!("wait for boot completed failed: {e}");
+     }
