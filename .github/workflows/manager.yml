@@ -414,6 +414,7 @@ jobs:
             asteroids)
               markers=(
                 'Asteroids late-load: recreating zygote-start boundary'
+          'RMN_ASTEROIDS_VECTOR_SERVICE_V4'
                 'Asteroids late-load: Vector root daemon socket registered'
                 'Asteroids late-load: KernelSU Manager restarted after late-load'
               )
