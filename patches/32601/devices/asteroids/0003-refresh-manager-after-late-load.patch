@@ -1,7 +1,225 @@
 diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
 --- a/userspace/ksud/src/late_load.rs
 +++ b/userspace/ksud/src/late_load.rs
-@@ -290,1 +290,52 @@ fn process_id(name: &str) -> Option<String> {
+@@ -221,49 +221,84 @@ fn launch_vector_service_directly() -> Result<()> {
+     let service_path = Path::new(VECTOR_DIR).join("service.sh");
+-    info!(
+-        "Asteroids late-load: launching Vector directly with /system/bin/sh ({}) log={}",
+-        service_path.display(),
+-        VECTOR_SERVICE_LOG
+-    );
+-    let stdout = fs::File::create(VECTOR_SERVICE_LOG)
+-        .context("failed to create Vector service launcher log")?;
+-    let stderr = stdout
+-        .try_clone()
+-        .context("failed to clone Vector service launcher log")?;
+-    let mut child = Command::new("/system/bin/sh")
+-        .arg(&service_path)
+-        .stdout(Stdio::from(stdout))
+-        .stderr(Stdio::from(stderr))
+-        .spawn()
+-        .context("failed to spawn monitored Vector service launcher")?;
+-
+-    for _ in 0..150 {
+-        if vector_socket_registered() {
+-            info!(
+-                "Asteroids late-load: monitored Vector launcher registered {} (pid={})",
+-                VECTOR_SOCKET,
+-                child.id()
+-            );
+-            return Ok(());
+-        }
+-        if let Some(status) = child
+-            .try_wait()
+-            .context("failed to query monitored Vector service launcher")?
+-        {
+-            anyhow::bail!(
+-                "Vector service launcher exited {status} before registering {VECTOR_SOCKET}; see {VECTOR_SERVICE_LOG}"
+-            );
+-        }
+-        thread::sleep(Duration::from_millis(100));
+-    }
+-
+-    anyhow::bail!(
+-        "Vector service launcher pid={} did not register {} within 15 seconds (inode_exists={}); see {}",
+-        child.id(),
+-        VECTOR_SOCKET,
+-        Path::new(VECTOR_SOCKET).exists(),
+-        VECTOR_SERVICE_LOG
+-    )
++    let mut last_error = None;
++
++    for attempt in 1..=3 {
++        if attempt > 1 {
++            stop_stale_vector_launcher();
++            if Path::new(VECTOR_SOCKET).exists() && !vector_socket_registered() {
++                let _ = fs::remove_file(VECTOR_SOCKET);
++            }
++            thread::sleep(Duration::from_millis(350));
++        }
++
++        info!(
++            "Asteroids late-load: launching Vector directly with /system/bin/sh ({}) log={} attempt={attempt}/3",
++            service_path.display(),
++            VECTOR_SERVICE_LOG
++        );
++        let stdout = OpenOptions::new()
++            .create(true)
++            .write(true)
++            .append(attempt > 1)
++            .truncate(attempt == 1)
++            .open(VECTOR_SERVICE_LOG)
++            .context("failed to create Vector service launcher log")?;
++        let stderr = stdout
++            .try_clone()
++            .context("failed to clone Vector service launcher log")?;
++        let mut child = Command::new("/system/bin/sh")
++            .arg(&service_path)
++            .stdout(Stdio::from(stdout))
++            .stderr(Stdio::from(stderr))
++            .spawn()
++            .context("failed to spawn monitored Vector service launcher")?;
++
++        let mut attempt_error = None;
++        for _ in 0..150 {
++            if vector_socket_registered() {
++                info!(
++                    "Asteroids late-load: monitored Vector launcher registered {} (pid={} attempt={attempt})",
++                    VECTOR_SOCKET,
++                    child.id()
++                );
++                return Ok(());
++            }
++            if let Some(status) = child
++                .try_wait()
++                .context("failed to query monitored Vector service launcher")?
++            {
++                attempt_error = Some(anyhow::anyhow!(
++                    "Vector service launcher exited {status} before registering {VECTOR_SOCKET}"
++                ));
++                break;
++            }
++            thread::sleep(Duration::from_millis(100));
++        }
++
++        if attempt_error.is_none() {
++            let _ = child.kill();
++            attempt_error = Some(anyhow::anyhow!(
++                "Vector service launcher pid={} did not register {} within 15 seconds (inode_exists={})",
++                child.id(),
++                VECTOR_SOCKET,
++                Path::new(VECTOR_SOCKET).exists()
++            ));
++        }
++
++        let error = attempt_error.expect("attempt error must be recorded");
++        warn!("Asteroids late-load: Vector launch attempt {attempt}/3 failed: {error:#}");
++        last_error = Some(error);
++    }
++
++    Err(last_error
++        .unwrap_or_else(|| anyhow::anyhow!("Vector service launcher failed without an error"))
++        .context(format!("see {VECTOR_SERVICE_LOG}")))
+ }
+ 
+ fn verify_vector_framework_cli() -> Result<()> {
+@@ -290,1 +325,126 @@ fn process_id(name: &str) -> Option<String> {
++const SOFT_REBOOT_WATCHDOG_TAG: &str = "RMN_ASTEROIDS_SOFT_REBOOT_WATCHDOG_V1";
++const SOFT_REBOOT_WATCHDOG_LOG: &str = "/data/local/tmp/root-my-nothing-soft-reboot-watchdog.log";
++const SOFT_REBOOT_WATCHDOG_SCRIPT: &str = r#"
++# RMN_ASTEROIDS_SOFT_REBOOT_WATCHDOG_V1
++last=$(/system/bin/pidof system_server 2>/dev/null)
++while /system/bin/sleep 2; do
++    current=$(/system/bin/pidof system_server 2>/dev/null)
++    [ -n "$current" ] || continue
++    [ "$current" = "$last" ] && continue
++    last="$current"
++
++    # Nothing OS occasionally recreates the Android framework without rebooting
++    # the kernel. KernelSU therefore remains live while Zygisk/Vector's userspace
++    # daemons disappear. Wait for the replacement zygote/system_server to settle,
++    # then replay only the service-side entrypoints that are expected to be
++    # restart-safe. The normal late-load path remains responsible for mounts and
++    # post-fs-data setup.
++    [ "$(/system/bin/getprop init.svc.zygote)" = "running" ] || continue
++    /system/bin/sleep 1
++
++    if [ -f /data/adb/modules/zygisksu/service.sh ] && [ ! -e /data/adb/modules/zygisksu/disable ]; then
++        /system/bin/sh /data/adb/modules/zygisksu/service.sh >>/data/local/tmp/root-my-nothing-zygisksu-recover.log 2>&1 &
++    fi
++
++    if [ -f /data/adb/modules/zygisk_vector/service.sh ] && [ ! -e /data/adb/modules/zygisk_vector/disable ]; then
++        if ! /system/bin/grep -Fq '/data/adb/lspd/.cli_sock' /proc/net/unix 2>/dev/null; then
++            /system/bin/rm -f /data/adb/lspd/.cli_sock
++            /system/bin/sh /data/adb/modules/zygisk_vector/service.sh >>/data/local/tmp/root-my-nothing-vector-recover.log 2>&1 &
++        fi
++    fi
++done
++"#;
++
++fn soft_reboot_watchdog_running() -> bool {
++    let my_pid = std::process::id().to_string();
++    let Ok(entries) = fs::read_dir("/proc") else {
++        return false;
++    };
++    for entry in entries.flatten() {
++        let name = entry.file_name();
++        let Some(pid) = name.to_str() else {
++            continue;
++        };
++        if pid == my_pid || !pid.as_bytes().iter().all(u8::is_ascii_digit) {
++            continue;
++        }
++        let cmdline = fs::read(entry.path().join("cmdline")).unwrap_or_default();
++        if String::from_utf8_lossy(&cmdline).contains(SOFT_REBOOT_WATCHDOG_TAG) {
++            return true;
++        }
++    }
++    false
++}
++
++fn start_soft_reboot_watchdog() {
++    if soft_reboot_watchdog_running() {
++        info!("Asteroids late-load: soft-reboot module watchdog already running");
++        return;
++    }
++
++    let stdout = match OpenOptions::new()
++        .create(true)
++        .append(true)
++        .open(SOFT_REBOOT_WATCHDOG_LOG)
++    {
++        Ok(file) => file,
++        Err(error) => {
++            warn!("Asteroids late-load: cannot open soft-reboot watchdog log: {error}");
++            return;
++        }
++    };
++    let stderr = match stdout.try_clone() {
++        Ok(file) => file,
++        Err(error) => {
++            warn!("Asteroids late-load: cannot clone soft-reboot watchdog log: {error}");
++            return;
++        }
++    };
++
++    match Command::new("/system/bin/sh")
++        .args(["-c", SOFT_REBOOT_WATCHDOG_SCRIPT])
++        .stdin(Stdio::null())
++        .stdout(Stdio::from(stdout))
++        .stderr(Stdio::from(stderr))
++        .spawn()
++    {
++        Ok(child) => info!(
++            "Asteroids late-load: soft-reboot module watchdog started pid={}",
++            child.id()
++        ),
++        Err(error) => warn!(
++            "Asteroids late-load: failed to start soft-reboot module watchdog: {error}"
++        ),
++    }
++}
++
 +fn activity_manager_ready() -> bool {
 +    for _ in 0..40 {
 +        let ready = Command::new("/system/bin/am")
@@ -54,12 +272,17 @@ diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
 +}
 +
  fn process_id(name: &str) -> Option<String> {
-@@ -376,3 +427,3 @@ fn dump_process_info(label: &str) {
+@@ -376,3 +536,3 @@ fn dump_process_info(label: &str) {
  pub fn run(
 -    _package_name: &String,
 +    package_name: &str,
      kmi: Option<String>,
-@@ -586,1 +637,6 @@ pub fn run(
+@@ -586,1 +746,10 @@ pub fn run(
++    // Keep a tiny root-side watcher outside the Android framework. Nothing OS
++    // can replace zygote/system_server without changing the kernel boot_id;
++    // this replays the service-side Zygisk/Vector launch after that boundary.
++    start_soft_reboot_watchdog();
++
 +    // Refresh the Manager only after the requested module lifecycle and its
 +    // current-boot completion marker are durable. This is best-effort: a UI
 +    // launch failure must not invalidate an otherwise healthy root session.
