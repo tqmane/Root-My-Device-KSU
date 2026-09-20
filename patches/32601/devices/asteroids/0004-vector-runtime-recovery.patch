@@ -1,0 +1,154 @@
+diff --git a/userspace/ksud/src/late_load.rs b/userspace/ksud/src/late_load.rs
+--- a/userspace/ksud/src/late_load.rs
++++ b/userspace/ksud/src/late_load.rs
+@@ -9,6 +9,6 @@ use std::path::Path;
+ use std::process::{Command, Stdio};
+ use std::thread;
+-use std::time::Duration;
++use std::time::{Duration, Instant};
+ 
+ use crate::module::{handle_updated_modules, prune_modules};
+ use crate::{assets, defs, init_event, metamodule, restorecon, utils};
+@@ -17,5 +17,6 @@ use crate::{assets, defs, init_event, metamodule, restorecon, utils};
+ const VECTOR_DIR: &str = "/data/adb/modules/zygisk_vector";
+ const VECTOR_SOCKET: &str = "/data/adb/lspd/.cli_sock";
++const VECTOR_MODULE_ID: &str = "zygisk_vector";
+ const VECTOR_SERVICE_LOG: &str = "/data/local/tmp/root-my-nothing-vector-service.log";
+ const MODULE_LIFECYCLE_LOG: &str = "/data/local/tmp/root-my-nothing-modules.log";
+ const VECTOR_SERVICE_MARKER: &str = "RMN_ASTEROIDS_VECTOR_SERVICE_V2";
+@@ -159,31 +160,57 @@ fn vector_socket_registered() -> bool {
+         .unwrap_or(false)
+ }
+ 
+-fn stop_stale_vector_launcher() {
++fn stop_stale_vector_launcher() -> Result<()> {
+     let Ok(entries) = fs::read_dir("/proc") else {
+-        return;
++        return Ok(());
+     };
++    let mut stale_pids = Vec::new();
+     for entry in entries.flatten() {
+         let Some(pid) = entry
+             .file_name()
+             .to_str()
+             .and_then(|s| s.parse::<u32>().ok())
+         else {
+             continue;
+         };
+         let cmdline = fs::read(entry.path().join("cmdline")).unwrap_or_default();
+-        if !String::from_utf8_lossy(&cmdline).contains("/data/adb/modules/zygisk_vector/daemon") {
++        let command = String::from_utf8_lossy(&cmdline);
++        let comm = fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
++        let maps = fs::read_to_string(entry.path().join("maps")).unwrap_or_default();
++        if !command.contains("/data/adb/modules/zygisk_vector/daemon")
++            && !command.contains("org.matrix.vector.daemon.VectorDaemon")
++            && comm.trim() != "vectord"
++            && !maps.contains("/data/adb/modules/zygisk_vector/daemon.apk")
++        {
+             continue;
+         }
+         warn!("Asteroids late-load: stopping stale Vector launcher pid={pid}");
+         match Command::new("/system/bin/kill")
+             .args(["-9", &pid.to_string()])
+             .status()
+         {
+-            Ok(status) if status.success() => {}
++            Ok(status) if status.success() => stale_pids.push(pid),
+             Ok(status) => warn!("Asteroids late-load: kill pid={pid} exited {status}"),
+             Err(err) => warn!("Asteroids late-load: kill pid={pid} failed: {err}"),
+         }
+     }
++    if stale_pids.is_empty() {
++        return Ok(());
++    }
++    let timeout = Duration::from_secs(5);
++    let started = Instant::now();
++    while started.elapsed() < timeout {
++        stale_pids.retain(|pid| Path::new("/proc").join(pid.to_string()).exists());
++        if stale_pids.is_empty() {
++            info!("Asteroids late-load: stale Vector processes exited");
++            return Ok(());
++        }
++        thread::sleep(Duration::from_millis(50));
++    }
++    anyhow::bail!(
++        "stale Vector processes did not exit within {} seconds: {:?}",
++        timeout.as_secs(),
++        stale_pids
++    )
+ }
+ fn prepare_vector_service_stage() -> Result<VectorServiceState> {
+@@ -195,7 +226,7 @@ fn prepare_vector_service_stage() -> Result<VectorServiceState> {
+         info!("Asteroids late-load: existing Vector root daemon socket is registered");
+         return Ok(VectorServiceState::Running);
+     }
+-    stop_stale_vector_launcher();
++    stop_stale_vector_launcher()?;
+     if Path::new(VECTOR_SOCKET).exists() {
+         warn!("Asteroids late-load: removing stale Vector CLI socket inode");
+         fs::remove_file(VECTOR_SOCKET).context("failed to remove stale Vector CLI socket inode")?;
+@@ -225,7 +256,9 @@ fn launch_vector_service_directly() -> Result<()> {
+         .try_clone()
+         .context("failed to clone Vector service launcher log")?;
+     let mut child = Command::new("/system/bin/sh")
++        .current_dir(VECTOR_DIR)
+         .arg(&service_path)
++        .envs(crate::module::get_common_script_envs(Some(VECTOR_MODULE_ID)))
+         .stdout(Stdio::from(stdout))
+         .stderr(Stdio::from(stderr))
+         .spawn()
+@@ -233,4 +266,5 @@ fn launch_vector_service_directly() -> Result<()> {
+         .context("failed to spawn monitored Vector service launcher")?;
++    let mut clean_exit = None;
+     for _ in 0..150 {
+         if vector_socket_registered() {
+             info!(
+@@ -242,21 +276,38 @@ fn launch_vector_service_directly() -> Result<()> {
+             );
+             return Ok(());
+         }
+-        if let Some(status) = child
+-            .try_wait()
+-            .context("failed to query monitored Vector service launcher")?
+-        {
+-            anyhow::bail!(
+-                "Vector service launcher exited {status} before registering {VECTOR_SOCKET}; see {VECTOR_SERVICE_LOG}"
+-            );
++        if clean_exit.is_none() {
++            if let Some(status) = child
++                .try_wait()
++                .context("failed to query monitored Vector service launcher")?
++            {
++                if !status.success() {
++                    anyhow::bail!(
++                        "Vector service launcher exited {status} before registering {VECTOR_SOCKET}; see {VECTOR_SERVICE_LOG}"
++                    );
++                }
++                warn!(
++                    "Asteroids late-load: Vector launcher exited cleanly before socket registration; waiting for a detached daemon"
++                );
++                clean_exit = Some(status);
++            }
+         }
+         thread::sleep(Duration::from_millis(100));
+     }
++    if let Some(status) = clean_exit {
++        anyhow::bail!(
++            "Vector service launcher exited {status} but {VECTOR_SOCKET} was not registered within 15 seconds; see {VECTOR_SERVICE_LOG}"
++        );
++    }
++    let pid = child.id();
++    let inode_exists = Path::new(VECTOR_SOCKET).exists();
++    let _ = child.kill();
++    let _ = child.wait();
+     anyhow::bail!(
+-        "Vector service launcher pid={} did not register {} within 15 seconds (inode_exists={}); see {}",
+-        child.id(),
++        "Vector service launcher pid={} did not register {} within 15 seconds (inode_exists={}); launcher terminated; see {}",
++        pid,
+         VECTOR_SOCKET,
+-        Path::new(VECTOR_SOCKET).exists(),
++        inode_exists,
+         VECTOR_SERVICE_LOG
+     )
+ }
